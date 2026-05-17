@@ -12,11 +12,16 @@ Author: You
 """
 
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
+# os.environ["CUDA_VISIBLE_DEVICES"] = ""
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+import json
 import re
 import sys
+import threading
+import time
 from typing import List
+import torch
+import requests
 
 
 # ---- FIXED LANGCHAIN IMPORTS ----
@@ -81,6 +86,16 @@ Clauses reference 38.413 structure (e.g. 8.x for procedures, 9.x for
 message/IE encoding).
 {_BASE_RULES}""",
 
+    "38_300": f"""
+You are a 3GPP NR overall protocol and architecture expert for TS 38.300.
+
+Spec scope: NR overall description, system architecture, RAN protocols,
+NR frame structure, logical channels, transport channels, network
+architecture, gNB-CU/gNB-DU split, Xn/X2/NG interfaces, and protocol
+stack basics. Clauses reference 38.300 structure for NR design and
+architecture details.
+{_BASE_RULES}""",
+
     "28_552": f"""
 You are a 3GPP 5G NR Performance Measurement (TS 28.552) expert.
 
@@ -115,6 +130,20 @@ You are a 3GPP standards expert.
 # UTILITIES
 # =========================
 
+# print(torch.cuda.is_available())          # should be True
+# print(torch.cuda.get_device_name(0))      # should show GTX 1050
+
+
+def show_gpu_info():
+    if torch.cuda.is_available():
+        print(f"✅ CUDA is available. {torch.cuda.device_count()} GPU(s) detected.")
+        for i in range(torch.cuda.device_count()):
+            print(f"   GPU {i}: {torch.cuda.get_device_name(i)}")
+        current = torch.cuda.current_device()
+        print(f"👉 Using GPU index {current}: {torch.cuda.get_device_name(current)}")
+    else:
+        print("⚠️ CUDA not available. Running on CPU only.")
+
 def clause_aware_splitter():
     """
     Clause-oriented text splitter.
@@ -125,9 +154,9 @@ def clause_aware_splitter():
         chunk_overlap=150,
         separators=[
             "\n\n",
-            "\n\d+\.\d+\.\d+",
-            "\n\d+\.\d+",
-            "\n",
+            "\\n\\d+\\.\\d+\\.\\d+",
+            "\\n\\d+\\.\\d+",
+            "\\n",
             " "
         ]
     )
@@ -147,6 +176,7 @@ def detect_ts_from_query(query: str) -> str:
     # --- 1. Direct TS number reference ---
     # Matches patterns like: ts38.331, 38.331, 38-331, 38_331, 38331
     _TS_NUMBER_MAP = {
+        "38.300": "38_300", "38300": "38_300", "38-300": "38_300",
         "38.331": "38_331", "38331": "38_331", "38-331": "38_331",
         "38.413": "38_413", "38413": "38_413", "38-413": "38_413",
         "28.552": "28_552", "28552": "28_552", "28-552": "28_552",
@@ -192,6 +222,17 @@ def detect_ts_from_query(query: str) -> str:
     ]):
         return "38_413"
 
+    # TS 38.300 — NR overall description and architecture
+    if any(k in q for k in [
+        "38.300", "38-300", "38300",
+        "overall description", "nr architecture", "ran architecture",
+        "system architecture", "logical channel", "transport channel",
+        "frame structure", "protocol stack", "gnb-cu", "gnb-du",
+        "x2 interface", "xn interface", "ng interface", "nr protocol",
+        "access architecture", "nr overall",
+    ]):
+        return "38_300"
+
     # TS 28.552 — 5G NR OAM performance measurements
     if any(k in q for k in [
         "oam", "o&m", "fault management", "performance measurement",
@@ -231,6 +272,34 @@ def detect_ts_from_query(query: str) -> str:
         return "32_425"
 
     return ""
+
+
+def _print_stop_hint():
+    print("⏳ Press Ctrl+C to stop the current model operation and return to the prompt.")
+
+
+def _spinner_task(stop_event: threading.Event):
+    spinner = "|/-\\"
+    idx = 0
+    while not stop_event.is_set():
+        print(f"\r⏳ Running model... Press Ctrl+C to stop. {spinner[idx % len(spinner)]}", end="", flush=True)
+        idx += 1
+        time.sleep(0.1)
+    print("\r", end="", flush=True)
+
+
+def invoke_with_interrupt(llm, prompt: str) -> str:
+    stop_event = threading.Event()
+    spinner = threading.Thread(target=_spinner_task, args=(stop_event,), daemon=True)
+    spinner.start()
+    try:
+        return llm.invoke(prompt)
+    except KeyboardInterrupt:
+        print("\n⏹️ Model run stopped by user.")
+        raise
+    finally:
+        stop_event.set()
+        spinner.join()
 
 
 # =========================
@@ -278,6 +347,11 @@ def ingest_ts(ts_name: str):
 
     print(f"  → Chunks created: {len(chunks)}")
 
+    # embeddings = HuggingFaceEmbeddings(
+    #     model_name=EMBED_MODEL,
+    #     model_kwargs={"device": "cuda"},
+    #     encode_kwargs={"batch_size": 16},  # lower batch size to avoid OOM
+    # )
     embeddings = HuggingFaceEmbeddings(model_name=EMBED_MODEL)
     vectordb = FAISS.from_documents(chunks, embeddings)
 
@@ -326,6 +400,56 @@ def format_context(docs) -> str:
         parts.append(f"{header}\n{d.page_content.strip()}")
     return "\n\n" + "\n\n".join(parts) + "\n"
 
+MAX_CHAT_HISTORY = 5
+MAX_FEEDBACK_HISTORY = 10
+FEEDBACK_FILE = "./feedback_history.json"
+
+
+def stringify_conversation_history(history: List[tuple[str, str]]) -> str:
+    if not history:
+        return ""
+    parts = []
+    for idx, (user, assistant) in enumerate(history[-MAX_CHAT_HISTORY:], start=1):
+        parts.append(f"Turn {idx} — User: {user}\nAssistant: {assistant}")
+    return "Previous conversation:\n" + "\n\n".join(parts) + "\n\n"
+
+
+def load_feedback_history() -> List[dict]:
+    if not os.path.exists(FEEDBACK_FILE):
+        return []
+    try:
+        with open(FEEDBACK_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def save_feedback_history(history: List[dict]):
+    with open(FEEDBACK_FILE, "w", encoding="utf-8") as f:
+        json.dump(history[-MAX_FEEDBACK_HISTORY:], f, indent=2, ensure_ascii=False)
+
+
+def append_feedback_history(query: str, answer: str, correction: str) -> List[dict]:
+    history = load_feedback_history()
+    history.append({
+        "query": query,
+        "answer": answer,
+        "correction": correction,
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+    })
+    save_feedback_history(history)
+    return history
+
+
+def stringify_feedback_history(history: List[dict]) -> str:
+    if not history:
+        return ""
+    parts = []
+    for item in history[-MAX_FEEDBACK_HISTORY:]:
+        parts.append(f"Query: {item['query']}\nCorrection: {item['correction']}")
+    return "Past corrections:\n" + "\n\n".join(parts) + "\n\n"
+
+
 def normalize_query(q: str, ts: str = "") -> str:
     ql = q.lower()
     # 38.331 expansions
@@ -346,6 +470,72 @@ def normalize_query(q: str, ts: str = "") -> str:
             " 4.3.1.3 performance measurement UTRAN"
         )
     return q
+
+
+def plan_query(user_query: str, conversation_history: List[tuple[str, str]] = None, feedback_history: List[dict] = None) -> List[str]:
+    """
+    Use the LLM to break down the query into reasoning steps.
+    """
+    print("🤔 Thinking... planning the reasoning steps.")
+    llm = Ollama(model="qwen2.5:7b", temperature=0)
+    history_text = stringify_conversation_history(conversation_history or [])
+    feedback_text = stringify_feedback_history(feedback_history or [])
+    plan_prompt = f"""
+    {history_text}{feedback_text}Decompose the following query into step-by-step reasoning tasks.
+    Query: {user_query}
+    Steps:
+    """
+    _print_stop_hint()
+    steps_text = invoke_with_interrupt(llm, plan_prompt)
+    steps = [s.strip() for s in steps_text.split("\n") if s.strip()]
+    print(f"✅ Planning complete: {len(steps)} step(s) detected.")
+    return steps
+
+
+def agentic_answer(query: str, conversation_history: List[tuple[str, str]] = None, feedback_history: List[dict] = None) -> str:
+    """
+    Agentic reasoning loop: plan → retrieve → reason → verify.
+    """
+    steps = plan_query(query, conversation_history, feedback_history)
+    answers = []
+    history_text = stringify_conversation_history(conversation_history or [])
+    feedback_text = stringify_feedback_history(feedback_history or [])
+
+    print(f"🧠 Reasoning through {len(steps)} step(s)...")
+    for idx, step in enumerate(steps, start=1):
+        # Route retrieval if needed
+        ts = detect_ts_from_query(step)
+        context = ""
+        if ts:
+            db_path = os.path.join(VECTOR_DB_DIR, f"TS_{ts}")
+            if os.path.isdir(db_path):
+                vectordb = load_vector_db(ts)
+                docs = vectordb.similarity_search(step, k=4)
+                context = format_context(docs)
+                print(f"   • Retrieved {len(docs)} excerpt(s) from TS {ts} for step {idx}.")
+        if not context:
+            print(f"   • No direct context found for step {idx}. Reasoning without retrieved context.")
+
+        print(f"   → Step {idx}/{len(steps)}: {step}")
+        llm = Ollama(model="qwen2.5:7b", temperature=0)
+        reasoning_prompt = f"""
+        {history_text}{feedback_text}Step: {step}
+        Context: {context if context else "No context retrieved"}
+        Provide reasoning or an answer for this step.
+        """
+        _print_stop_hint()
+        answers.append(invoke_with_interrupt(llm, reasoning_prompt).strip())
+
+    # Reflection / verification
+    print("🔍 Verifying and combining step answers into the final response.")
+    final_llm = Ollama(model="qwen2.5:7b", temperature=0)
+    verify_prompt = f"""
+    {history_text}{feedback_text}Combine and verify the following step answers into a final coherent response.
+    Ensure all claims are supported by context.
+    Answers: {answers}
+    """
+    _print_stop_hint()
+    return invoke_with_interrupt(final_llm, verify_prompt).strip()
 
 def answer_query(query: str):
     ts = detect_ts_from_query(query)
@@ -391,7 +581,8 @@ Instructions for your answer:
         temperature=LLM_TEMPERATURE,
     )
 
-    return llm.invoke(prompt).strip()
+    _print_stop_hint()
+    return invoke_with_interrupt(llm, prompt).strip()
 
 
 # =========================
@@ -402,17 +593,59 @@ def chat_loop():
     print("\n📡 3GPP RAG Engineering Chatbot")
     print("Type 'exit' to quit\n")
 
+    conversation_history: List[tuple[str, str]] = []
+    feedback_history = load_feedback_history()
+    last_query = None
+    last_response = None
+
     while True:
-        query = input("You> ").strip()
+        try:
+            query = input("You> ").strip()
+        except KeyboardInterrupt:
+            print("\n❗ KeyboardInterrupt received. Type 'exit' or 'quit' to leave, or continue with a new query.")
+            continue
+
         if query.lower() in ("exit", "quit"):
             break
 
+        if query.lower() in ("new chat", "reset", "clear chat"):
+            conversation_history.clear()
+            print("🔄 New chat started. Previous context has been cleared.")
+            continue
+
+        if query.lower().startswith("correction:") or query.lower().startswith("fix:") or query.lower().startswith("feedback:"):
+            if last_query is None:
+                print("⚠️ No previous answer to attach correction to.")
+                continue
+            correction_text = query.split(":", 1)[1].strip() if ":" in query else ""
+            if not correction_text:
+                print("⚠️ Please provide a correction after 'correction:' or 'fix:'.")
+                continue
+            feedback_history = append_feedback_history(last_query, last_response, correction_text)
+            print("✅ Correction saved for future use.")
+            continue
+
         print("\nBot>")
-        print(answer_query(query))
+        try:
+            response = agentic_answer(query, conversation_history, feedback_history)
+            print(response)
+            last_query = query
+            last_response = response
+            conversation_history.append((query, response))
+            if len(conversation_history) > MAX_CHAT_HISTORY:
+                conversation_history.pop(0)
+        except KeyboardInterrupt:
+            print("\n⏹️ Model run stopped. Back to prompt.")
+        except requests.exceptions.RequestException as e:
+            print(f"\n⚠️ Model request failed: {e}")
+        except Exception as e:
+            print(f"\n⚠️ Unexpected error: {e}")
         print("")
 
 
 def main():
+    # Call this once at startup
+    # show_gpu_info()
     if len(sys.argv) > 1:
         if sys.argv[1] == "ingest":
             if len(sys.argv) == 3:
